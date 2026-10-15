@@ -1,0 +1,66 @@
+# --- Secrets / environment -------------------------------------------------
+# Never commit real values. Copy the .env.example files and fill them locally.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# --- Node / frontend ------------------------------------------------------
+node_modules/
+dist/
+dist-ssr/
+.vite/
+coverage/
+*.tsbuildinfo
+*.local
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- Python / backend -----------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.eggs/
+build/
+htmlcov/
+.coverage
+.coverage.*
+bandit-report.json
+pip-audit*.json
+
+# --- Local runtime data ---------------------------------------------------
+# Job scratch space used when running the API outside a container.
+.cleanslate-tmp/
+tmp/
+logs/
+*.log
+
+# --- Editor / OS ----------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+
+# --- Deployment tooling ---------------------------------------------------
+.wrangler/
+.render/
+
+# --- Local-only tool binaries ---------------------------------------------
+# ExifTool/qpdf downloaded for native (non-Docker) development. The container
+# installs them itself, so these must never be committed.
+.tools/
+
+# --- Agent / editor scratch ------------------------------------------------
+.freebuff/

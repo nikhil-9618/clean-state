@@ -1,0 +1,16 @@
+# Keep the build context minimal and secret-free while still allowing the
+# Dockerfile's `test` stage to COPY tests/ (that stage is how the container is
+# verified locally and in CI).
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+.venv
+venv
+.env
+.env.*
+!.env.example
+logs
+*.log
+.cleanslate-tmp
+cleanslate-jobs
+tmp

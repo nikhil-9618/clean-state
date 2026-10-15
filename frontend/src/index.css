@@ -1,0 +1,78 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Dark navy surfaces with a mint accent. Dark-only by design: no theme
+       toggle button exists, because a control that changes nothing is worse
+       than no control. */
+    --background: 220 55% 4%;
+    --foreground: 210 40% 96%;
+    --card: 219 48% 7%;
+    --card-foreground: 210 40% 96%;
+    --muted: 217 33% 13%;
+    --muted-foreground: 214 20% 70%;
+    --primary: 164 78% 58%;
+    --primary-foreground: 220 60% 6%;
+    --secondary: 217 33% 15%;
+    --secondary-foreground: 210 40% 96%;
+    --accent: 217 33% 18%;
+    --accent-foreground: 210 40% 96%;
+    --destructive: 0 72% 56%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 216 30% 19%;
+    --input: 216 30% 19%;
+    --ring: 164 78% 58%;
+    --radius: 0.75rem;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "cv11", "ss01";
+  }
+
+  :focus-visible {
+    @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-background;
+  }
+
+  ::selection {
+    background: rgba(62, 233, 192, 0.28);
+  }
+}
+
+@layer components {
+  .surface-grid {
+    background-image: theme("backgroundImage.grid");
+    background-size: 28px 28px;
+    mask-image: radial-gradient(ellipse at top, black 20%, transparent 75%);
+  }
+
+  .panel {
+    @apply rounded-lg border border-border/70 bg-card/70 backdrop-blur-sm;
+  }
+
+  .stat-value {
+    @apply font-mono text-lg text-mint-400;
+  }
+
+  .mono-value {
+    @apply break-all font-mono text-xs text-muted-foreground;
+  }
+}
+
+/* Respect users who ask for less motion. */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}

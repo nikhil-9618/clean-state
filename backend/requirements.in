@@ -1,0 +1,6 @@
+# CleanSlate API - top-level runtime dependencies.
+# The container installs requirements.lock.txt (fully pinned). This file records
+# the direct dependencies that the lockfile was resolved from.
+fastapi
+uvicorn
+python-multipart

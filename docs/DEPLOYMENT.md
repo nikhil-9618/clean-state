@@ -1,0 +1,315 @@
+# Deploying CleanSlate on free plans
+
+Target architecture — two hosts, both free, both on provider subdomains, no custom domain, no
+payment method required:
+
+```
+Visitor ──HTTPS──> https://<project>.pages.dev        Cloudflare Pages (free)   static React build
+       └──HTTPS──> https://<service>.onrender.com     Render free web service   Docker: FastAPI + ExifTool + qpdf
+```
+
+Why the API cannot live on Cloudflare Workers/Pages Functions: ExifTool is a Perl program, and the
+pipeline needs real subprocess execution, a writable per-job scratch directory and qpdf binaries.
+Workers have no subprocess API and no writable filesystem, so the metadata work runs on a container
+host instead. No part of the pipeline was downgraded or mocked to fit a host — the frontend got the
+edge host because a static build genuinely belongs there.
+
+---
+
+## 1. Verified free-plan facts (checked 2026-10)
+
+| Plan | What we rely on | Documented limits that affect this app |
+| --- | --- | --- |
+| **Render Free web service** | Docker build from this repo, HTTPS with an `onrender.com` subdomain, 512 MB RAM / 0.1 CPU class instance | 750 Free instance hours per workspace per month; **spins down after 15 min without inbound traffic and takes ~1 min to wake**; ephemeral filesystem (fine here); no persistent disks; no shell/SSH; outbound bandwidth and build minutes count against monthly allowances; free instances are explicitly "not for production" ([Render docs](https://render.com/docs/free)) |
+| **Cloudflare Pages Free** | Static asset hosting, HTTPS, `*.pages.dev` subdomain, HTTP headers via `_headers`, SPA fallback via `_redirects` | 20,000 files per deployment, 25 MiB max single asset, 500 builds/month, unlimited bandwidth/requests; 100 custom domains per project ([Pages limits](https://developers.cloudflare.com/pages/platform/limits/)) |
+
+If those plans change, the app still runs locally in Docker; only the hosting steps below would need
+to be re-pointed at another container host (Koyeb, Fly.io, Northflank and Railway all had free tiers
+at the time of writing, with varying card requirements). The requirements are narrow and portable:
+one Docker image, one HTTP port reading `PORT`, no database, no persistent volume.
+
+---
+
+## 2. Environment variables
+
+### API (`backend/.env.example` is the source of truth)
+
+| Variable | Production value | Notes |
+| --- | --- | --- |
+| `ENVIRONMENT` | `production` | Enables strict startup checks and HSTS |
+| `ALLOWED_ORIGINS` | `https://<project>.pages.dev` | Comma-separated **exact** origins. Wildcards abort startup |
+| `SECRET_KEY` | random 32+ bytes | HMACs client addresses, derives job ids. `render.yaml` uses `generateValue` |
+| `PORT` | provided by Render (default `8787`) | uvicorn binds `$PORT` |
+| `MAX_UPLOAD_BYTES` | `26214400` | 25 MiB |
+| `MAX_CONCURRENT_JOBS` | `2` | Free instance is small |
+| `MAX_TEMP_BYTES` | `67108864` | 64 MiB scratch budget |
+| `RATE_LIMIT_REQUESTS` / `RATE_LIMIT_WINDOW_SECONDS` | `20` / `60` | Per client IP, per process; 429 + `Retry-After` |
+| `JOB_TTL_SECONDS` | `300` | Undownloaded sanitized copies are swept |
+| `DOWNLOAD_TOKEN_TTL_SECONDS` | `300` | Single-use download window |
+| `DOWNLOAD_BIND_IP` | `true` | Link only works from the requesting address |
+| `TRUST_PROXY_HEADERS` | `true` **on Render only** | Render's proxy sets `X-Forwarded-For`. Leave `false` when the process is directly exposed |
+| `ENABLE_HSTS` | `true` | HTTPS-only transport policy |
+| `EXPOSE_API_DOCS` | `false` | Must be false in production; `/docs` stays closed |
+| `EXIFTOOL_PATH` / `QPDF_PATH` | unset | Resolved from `PATH` inside the image |
+
+### Frontend (Cloudflare Pages → Settings → Environment variables, and `frontend/.env.example`)
+
+| Variable | Production value | Notes |
+| --- | --- | --- |
+| `VITE_API_BASE_URL` | `https://<service>.onrender.com` | Exact origin, no trailing slash. Baked into the CSP `connect-src` and `dist/_headers` at build time |
+| `DEV_API_TARGET` | unused in production | Only for the local vite proxy |
+
+---
+
+## 3. Deploy the API on Render (free)
+
+### 3.1 Prepare the repository
+
+```bash
+cd /path/to/clean-state
+git init && git add . && git commit -m "CleanSlate"
+git remote add origin https://github.com/<you>/clean-state.git
+git push -u origin main
+```
+
+```powershell
+cd C:\path\to\clean-state
+git init; git add .; git commit -m "CleanSlate"
+git remote add origin https://github.com/<you>/clean-state.git
+git push -u origin main
+```
+
+`.gitignore` already excludes `.env`, `node_modules`, `dist`, `.venv`, scratch directories and logs.
+Do not commit a real `.env`.
+
+### 3.2 Create the service
+
+1. <https://dashboard.render.com> → **New** → **Blueprint** → connect the repository.
+2. Render reads [`render.yaml`](../render.yaml), builds `backend/Dockerfile` (target `runtime`) and
+   creates the **cleanslate-api** Free web service.
+3. When prompted for `ALLOWED_ORIGINS`, enter your frontend origin (you can add it after step 4 and
+   Render will redeploy). `SECRET_KEY` is generated by Render.
+4. Wait for the deploy to finish, then open `https://<service>.onrender.com/api/health`.
+
+Expected response (excerpt):
+
+```json
+{"status":"ok","service":"cleanslate-api","environment":"production",
+ "tools":{"exiftool":{"available":true,"version":"13.59"},
+          "qpdf":{"available":true,"version":"qpdf version 12.4.2"}},
+ "accepts_uploads":true,"fingerprint_collection":false}
+```
+
+If `status` is `degraded` or `accepts_uploads` is `false`, the image was built without a working
+ExifTool — check the build log for the `exiftool -ver` line (see §7).
+
+Alternative without a Git repository (uses the Render CLI; still no card required):
+
+```bash
+# Linux/macOS
+render deploys create srv-xxxxxxxxxxxx --confirm --wait
+```
+
+### 3.3 Free-plan behaviour you must plan for
+
+* **Cold start.** After 15 idle minutes the service is spun down; the next request takes ~1 minute and
+  the visitor sees Render's loading page. Until the instance answers, the upload pages show a
+  "Processing is unavailable right now" notice (the UI keeps no permanent API status badge) — reload
+  once it is up. For a demo, hit `/api/health` first to wake it.
+* **750 instance hours/month.** A service that never idles can consume the allowance before month
+  end, after which all Free services are suspended until the 1st.
+* **Restarts wipe scratch data.** Harmless by design: uploads are meant to be ephemeral, and the
+  startup purge cleans the directory anyway.
+* **Local disk is not durable**, so never treat a Render free instance as storage.
+
+---
+
+## 4. Deploy the frontend on Cloudflare Pages (free)
+
+### 4.1 Build settings
+
+| Setting | Value |
+| --- | --- |
+| Framework preset | None (or Vite — both work) |
+| Build command | `npm ci && npm run build` |
+| Build output directory | `dist` |
+| Root directory | `frontend` |
+| Environment variable | `VITE_API_BASE_URL = https://<service>.onrender.com` |
+| Node version | 20 or 22 (`NODE_VERSION` env var if the default differs) |
+
+```powershell
+# PowerShell: same settings via the Pages project API (optional, for scripting)
+$env:CLOUDFLARE_API_TOKEN = "<pages:edit token>"
+$env:VITE_API_BASE_URL = "https://<service>.onrender.com"
+```
+
+### 4.2 CLI alternative (no Git needed)
+
+```bash
+# Linux/macOS
+cd frontend
+VITE_API_BASE_URL="https://<service>.onrender.com" npm ci && VITE_API_BASE_URL="https://<service>.onrender.com" npm run build
+npx wrangler pages project create cleanslate --production-branch main
+npx wrangler pages deploy dist --project-name cleanslate
+```
+
+```powershell
+# Windows PowerShell
+cd frontend
+$env:VITE_API_BASE_URL = "https://<service>.onrender.com"
+npm ci; npm run build
+npx wrangler pages project create cleanslate --production-branch main
+npx wrangler pages deploy dist --project-name cleanslate
+```
+
+The project gets a free `https://cleanslate.pages.dev` subdomain (plus a per-deployment preview URL).
+`public/_redirects` adds the SPA fallback so `/metadata/sanitize` and `/fingerprint` resolve on a
+hard refresh; `public/_headers` ships the CSP and security headers, with `connect-src` templated to
+your API origin during the build.
+
+### 4.3 Point the API at the frontend (CORS)
+
+The API refuses to start in production without an origin allowlist, and it never treats CORS as
+authentication. Set it to the **exact** origin(s):
+
+```bash
+# Render dashboard → cleanslate-api → Environment → edit ALLOWED_ORIGINS
+ALLOWED_ORIGINS=https://cleanslate.pages.dev
+# optionally, to test preview deployments against the same API:
+ALLOWED_ORIGINS=https://cleanslate.pages.dev,https://abc123.cleanslate.pages.dev
+```
+
+Save → Render redeploys (about a minute). Then verify from a shell:
+
+```bash
+curl -s -D - -o /dev/null -H "Origin: https://cleanslate.pages.dev" \
+  https://<service>.onrender.com/api/health | grep -i "access-control-allow-origin"
+# → access-control-allow-origin: https://cleanslate.pages.dev
+```
+
+```powershell
+curl.exe -s -D - -o NUL -H "Origin: https://cleanslate.pages.dev" `
+  https://<service>.onrender.com/api/health | Select-String "access-control-allow-origin"
+```
+
+If the badge in the footer says "API unreachable" while `/api/health` answers fine in curl, the
+origin is wrong (trailing slash, `http://`, `www.` or a different preview subdomain) — CORS failures
+look like network failures in the browser on purpose.
+
+---
+
+## 5. Verify HTTPS, inspection, sanitization, download and cleanup
+
+```bash
+API=https://<service>.onrender.com
+PAGE=https://<project>.pages.dev
+
+# 1. HTTPS + certificate (no expiry warning, HTTP/2, real certificate chain)
+curl -sS -o /dev/null -w "api %{http_code} http_version=%{http_version} tls=%{ssl_verify_result}\n" $API/api/health
+curl -sS -o /dev/null -w "web %{http_code} http_version=%{http_version} tls=%{ssl_verify_result}\n" $PAGE/
+# http->https is answered by the platforms' redirects
+curl -sS -o /dev/null -w "api redirect %{http_code} -> %{redirect_url}\n" http://<service>.onrender.com/api/health
+
+# 2. Security headers
+curl -sD - -o /dev/null $API/api/health | grep -iE "strict-transport|x-content-type|referrer-policy|x-frame|content-security"
+curl -sD - -o /dev/null $PAGE/ | grep -iE "content-security|x-content-type|referrer-policy|x-frame|strict-transport"
+
+# 3. Inspection + sanitization + download + single-use + cleanup
+python e2e/http_e2e.py $API      # 188 checks: formats, headers, CORS, rejections, cleanup
+```
+
+That E2E script needs two local tools to sanity-check the downloaded bytes (`exiftool`, `qpdf`); set
+`E2E_TEMP_ROOT` only when the API runs locally. A minimal manual version:
+
+```bash
+# inject metadata, upload, inspect
+exiftool -overwrite_original -Artist="Jane" -GPSLatitude=51.5 -GPSLatitudeRef=N photo.jpg
+curl -s -F "file=@photo.jpg" $API/api/v1/metadata/inspect | head -c 400
+
+# sanitize and download the result
+TOKEN=$(curl -s -F "file=@photo.jpg" $API/api/v1/metadata/sanitize | python -c "import sys,json;print(json.load(sys.stdin)['download']['token'])")
+curl -s -o clean.jpg "$API/api/v1/download/$TOKEN"
+exiftool -s -Artist -GPS:all clean.jpg      # → empty: the fields are gone
+curl -s -o /dev/null -w "second use: %{http_code}\n" "$API/api/v1/download/$TOKEN"   # → 404
+curl -s $API/api/health | python -c "import sys,json;print(json.load(sys.stdin)['storage'])"  # → jobs 0
+```
+
+```powershell
+# PowerShell equivalent of the sanitize + download + cleanup check
+$photo = "photo.jpg"
+$response = curl.exe -s -F "file=@$photo" "https://<service>.onrender.com/api/v1/metadata/sanitize" | ConvertFrom-Json
+$token = $response.download.token
+curl.exe -s -o clean.jpg "https://<service>.onrender.com/api/v1/download/$token"
+& exiftool -s -Artist -GPS:all clean.jpg                       # expect no values
+curl.exe -s -o NUL -w "second use: %{http_code}`n" "https://<service>.onrender.com/api/v1/download/$token"
+curl.exe -s "https://<service>.onrender.com/api/health" | ConvertFrom-Json | Select-Object -ExpandProperty storage
+```
+
+Finally open `$PAGE` in a browser: the footer badge must read **API ready · ExifTool 13.59**, and one
+round trip through *Clean a file* must produce a comparison and a working download.
+
+---
+
+## 6. Deployment verification checklist
+
+Tick every line on the **deployed** URLs, not locally. The record of the last run is in
+[VERIFICATION.md](VERIFICATION.md).
+
+- [ ] `GET https://<service>.onrender.com/api/health` → `200`, `status: ok`, `accepts_uploads: true`
+- [ ] `tools.exiftool.available` and `tools.qpdf.available` are both `true`
+- [ ] `fingerprint_collection` is `false` and `/docs` returns 404 (production docs disabled)
+- [ ] `GET /api/v1/limits` reports the deployed limits, formats and the processing notice
+- [ ] TLS: valid certificate on both hosts, `http://` redirects to `https://`, HSTS header present
+- [ ] Security headers present on both hosts (nosniff, no-referrer, frame denial, CSP)
+- [ ] CORS: allowed Origin is echoed, an unlisted Origin gets no `access-control-allow-origin`
+- [ ] Frontend loads, footer badge shows the API version, no console errors
+- [ ] Metadata inspection on a real photo shows GPS/author/software tags
+- [ ] Sanitization returns removed/retained/unverified lists and a size change
+- [ ] Downloaded copy has no GPS/identity tags when re-checked with ExifTool
+- [ ] Second use of the download link is refused (404)
+- [ ] `storage.jobs` returns to `0` after the download
+- [ ] Fingerprint dashboard collects signals with `network requests: 0`, no cookies, no storage
+- [ ] Canvas test stays skipped until the consent toggle is enabled
+- [ ] Rate limiting returns 429 with `Retry-After` after the configured burst
+- [ ] A traversal-style filename (`../../evil.jpg`) is handled with no file outside the scratch dir
+- [ ] An unsupported file type returns 415 and an oversized body returns 413
+- [ ] A truncated/malformed container returns 422 instead of a "cleaned" copy
+- [ ] Cold start: after 15 idle minutes the first request wakes the service within ~1 minute
+
+---
+
+## 7. Troubleshooting
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Browser console: CORS error / "API unreachable" badge | `ALLOWED_ORIGINS` does not exactly match the page origin (scheme, `www.`, preview subdomain, or a trailing slash) | Set the exact origin in Render, redeploy, re-check with the `curl -H "Origin: ..."` command |
+| `Mixed Content` warning, requests blocked on the HTTPS site | `VITE_API_BASE_URL` is `http://` | Use the `https://` origin and rebuild the Pages deployment (the value is baked into the CSP) |
+| Page loads but every API call is blocked by CSP | The build ran without `VITE_API_BASE_URL`, so `connect-src` only allows `'self'` | Set the variable in Pages build settings and redeploy |
+| First request takes ~1 minute | Render free instances spin down after 15 idle minutes | Expected; wake the service with a `/api/health` call before a demo |
+| `503 tool_unavailable` with `Retry-After` | ExifTool missing in the image, or the probe found it not executable | Check the build log for `exiftool -ver`; the Dockerfile fails the build if the pinned tarball cannot be installed. Confirm `EXIFTOOL_PATH` is not set to a wrong absolute path |
+| `503 processor_busy` | Concurrent-job or scratch-byte cap reached | Expected under load; raise `MAX_CONCURRENT_JOBS`/`MAX_TEMP_BYTES` or retry |
+| `422 unprocessable_file` on sanitize | The tool could not rewrite the file (truncated/malformed container) and nothing was removed | Not a bug: download a good copy of the file, or report it as a limitation. The API refuses to hand back an unchanged file |
+| `429 rate_limited` | Burst above `RATE_LIMIT_REQUESTS` | Wait `Retry-After` seconds; adjust the limit if the deployment is trusted |
+| `413 payload_too_large` | File above `MAX_UPLOAD_BYTES` | Raise the limit (mind the free instance's disk/RAM) or shrink the file |
+| `415 unsupported_file_type` | Extension not allowlisted, or the magic bytes do not match the extension | Convert to a supported format; the signature check is deliberate |
+| Download link "expired" immediately | Token already used (single use), expired (5 min), or fetched from a different client address | Re-run the sanitization; binding can be disabled with `DOWNLOAD_BIND_IP=false` |
+| Build fails at `sha256sum -c` | ExifTool tarball checksum changed (new release) | Update `EXIFTOOL_VERSION`/`EXIFTOOL_SHA256` in `backend/Dockerfile` together |
+| Pages build fails on Node version | Vite 6 needs Node 20+ | Set `NODE_VERSION=22` in Pages environment variables |
+| Preview URL blocked by CORS | Preview subdomains differ per deployment | Add the specific preview origin, or test previews against a local API |
+| Files vanish after a restart | Ephemeral filesystem (by design) | Nothing to fix — CleanSlate never promises storage |
+
+---
+
+## 8. Operating notes
+
+* **Updating the app:** `git push` redeploys both hosts (Render auto-deploys, Pages rebuilds).
+* **Rotating `SECRET_KEY`:** invalidates outstanding download tokens and rate-limit buckets. Harmless
+  — no data depends on it.
+* **Auditing dependencies:** `pip install pip-audit && pip-audit -r backend/requirements.lock.txt`
+  and `cd frontend && npm audit --omit=dev`.
+* **Tightening further:** lower `MAX_UPLOAD_BYTES`/`RATE_LIMIT_REQUESTS`, set
+  `MAX_CONCURRENT_JOBS=1` on the free instance, or add Cloudflare's free WAF/rate-limiting rules in
+  front of the API hostname.
+* **Taking the API offline:** delete the Render service (there is no data to export). Nothing about
+  the frontend keeps working without it, except the browser fingerprint dashboard, which is
+  client-side only — by design.

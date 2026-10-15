@@ -1,0 +1,7 @@
+# CleanSlate API - development / test / audit dependencies.
+# Installed on top of the pinned runtime lockfile:
+#   pip install -r requirements.lock.txt -r requirements-dev.in
+pytest
+httpx
+pillow
+pip-audit

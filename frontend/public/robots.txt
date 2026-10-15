@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+# CleanSlate ships no analytics, no crawlers of its own and no sitemap host.
