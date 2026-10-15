@@ -1,3 +1,0 @@
-# Single-page-application fallback: React Router handles deep links such as
-# /metadata/sanitize or /fingerprint. Static assets are served first.
-/*    /index.html   200
